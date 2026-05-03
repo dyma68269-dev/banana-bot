@@ -3,9 +3,3 @@ pillow
 requests
 flask
 flask-cors
-pyTelegramBotAPI
-/pillow
-requests
-flask
-flask-cors
-flask-cors
