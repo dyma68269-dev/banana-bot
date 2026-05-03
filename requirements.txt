@@ -4,7 +4,7 @@ requests
 flask
 flask-cors
 pyTelegramBotAPI
-pillow
+/pillow
 requests
 flask
 flask-cors
