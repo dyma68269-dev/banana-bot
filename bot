@@ -1,0 +1,788 @@
+import telebot
+import sqlite3
+import random
+import string
+import os
+import time
+import requests
+import io
+import threading
+import datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from telebot.apihelper import ApiTelegramException
+from PIL import Image
+
+# ========== НАСТРОЙКИ (ЗАМЕНИТЕ ТОКЕН И ID) ==========
+BOT_TOKEN = "8565283538:AAFRofE7y_L-bNojwLYyT_XBqd-h7KZb7JQ"   # ВАШ ТОКЕН
+RATE_LIMIT = 5
+FREE_START = 30
+PRICE_IMAGE = 15
+REFERRAL_BONUS = 10
+ADMIN_IDS = [8242980039]          # ВАШ TELEGRAM ID
+# ====================================================
+
+RANDOM_PROMPTS = [
+    "киберпанк кот в неоновых очках",
+    "закат над горами в стиле аниме",
+    "робот-банан играет на гитаре",
+    "единорог в космосе",
+    "старый мотоцикл Урал на фоне моря",
+    "котик-банан в шляпе",
+    "девушка с зонтиком в дождливом городе"
+]
+
+bot = telebot.TeleBot(BOT_TOKEN)
+user_last_request = {}
+user_tmp_size = {}
+user_model = {}
+db_lock = threading.Lock()
+video_semaphore = threading.Semaphore(1)
+
+# ---------- БАЗА ДАННЫХ ----------
+def init_db():
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (user_id INTEGER PRIMARY KEY,
+                      balance INTEGER DEFAULT 0,
+                      total_generated INTEGER DEFAULT 0,
+                      referrer_id INTEGER DEFAULT NULL,
+                      ref_code TEXT UNIQUE,
+                      last_daily TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS history
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER,
+                      prompt TEXT,
+                      image_data BLOB,
+                      size TEXT,
+                      timestamp REAL)''')
+        conn.commit()
+        conn.close()
+
+def save_to_history(user_id, prompt, image_bytes, size):
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("INSERT INTO history (user_id, prompt, image_data, size, timestamp) VALUES (?, ?, ?, ?, ?)",
+                  (user_id, prompt, image_bytes, size, time.time()))
+        conn.commit()
+        conn.close()
+
+# ---------- ЕЖЕДНЕВНЫЙ БОНУС ----------
+def daily_bonus(user_id):
+    today = datetime.date.today().isoformat()
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if row is None or row[0] != today:
+            c.execute("UPDATE users SET balance = balance + 5, last_daily = ? WHERE user_id = ?", (today, user_id))
+            conn.commit()
+            conn.close()
+            return True
+        conn.close()
+        return False
+
+# ---------- УЛУЧШЕНИЕ ПРОМПТА ----------
+def enhance_prompt(user_prompt: str) -> str:
+    low = user_prompt.lower().strip()
+    clothes = {
+        "футболка": "хлопковая футболка","джинсы": "синие джинсы","куртка": "кожаная куртка","пальто": "зимнее пальто","шапка": "вязаная шапка","кроссовки": "спортивные кроссовки","платье": "вечернее платье","костюм": "деловой костюм","свитер": "мягкий свитер","шорты": "летние шорты","кепка": "бейсболка","галстук": "элегантный галстук"
+    }
+    animals = {
+        "собака": "реалистичная собака","кот": "пушистый домашний кот","лошадь": "красивая лошадь","корова": "пятнистая корова","свинья": "розовая свинья","овца": "пушистая овца","коза": "белая коза","курица": "курица с цыплятами","утка": "утка на пруду","гусь": "белый гусь","кролик": "пушистый кролик","попугай": "яркий попугай","сова": "большая сова","орёл": "белоголовый орёл","лиса": "рыжая лиса","волк": "серый волк","медведь": "бурый медведь","тигр": "бенгальский тигр","лев": "африканский лев","слон": "африканский слон","жираф": "высокий жираф","зебра": "полосатая зебра","бегемот": "большой бегемот","носорог": "толстокожий носорог","панда": "милая панда","кенгуру": "прыгающий кенгуру","пингвин": "чёрно-белый пингвин","дельфин": "умный дельфин","кит": "огромный кит","акула": "опасная акула","осьминог": "щупальца осьминога","черепаха": "медленная черепаха"
+    }
+    car_brands = {
+        "bmw": "BMW, немецкий автомобиль","mercedes": "Mercedes-Benz","audi": "Audi","toyota": "Toyota","lada": "Лада Веста","porsche": "Porsche 911","ferrari": "Ferrari","lamborghini": "Lamborghini","tesla": "Tesla","honda": "Honda","hyundai": "Hyundai","kia": "Kia","renault": "Renault","ford": "Ford","chevrolet": "Chevrolet","volkswagen": "Volkswagen"
+    }
+    nature = {
+        "лес": "густой лес","горы": "высокие горы","река": "широкая река","озеро": "горное озеро","море": "синее море","водопад": "высокий водопад","пустыня": "пустыня Сахара","луг": "зелёный луг","поле": "поле пшеницы","пляж": "песчаный пляж","скалы": "крутые скалы","каньон": "глубокий каньон","пещера": "тёмная пещера","вулкан": "действующий вулкан","тундра": "заснеженная тундра","джунгли": "тропические джунгли"
+    }
+    people = {
+        "врач": "врач в белом халате","учитель": "учитель у доски","строитель": "строитель в каске","повар": "повар в колпаке","водитель": "водитель за рулём","пилот": "пилот в форме","космонавт": "космонавт в скафандре","полицейский": "полицейский в форме","пожарный": "пожарный в каске","спортсмен": "спортсмен в форме","художник": "художник с кистью","музыкант": "музыкант с гитарой","бизнесмен": "бизнесмен в костюме","фермер": "фермер в шляпе","рыбак": "рыбак с удочкой","охотник": "охотник с ружьём","турист": "турист с рюкзаком","ребёнок": "ребёнок, радостный","старик": "пожилой мужчина","старушка": "пожилая женщина"
+    }
+    objects = {
+        "телефон": "смартфон","компьютер": "компьютер","ноутбук": "ноутбук","книга": "открытая книга","часы": "наручные часы","очки": "очки для зрения","стул": "деревянный стул","стол": "деревянный стол","кровать": "мягкая кровать","диван": "удобный диван","шкаф": "платяной шкаф","лампа": "настольная лампа","холодильник": "белый холодильник","микроволновка": "СВЧ-печь","чайник": "электрический чайник","пылесос": "робот-пылесос"
+    }
+    extra = {
+        "дракон": "огнедышащий дракон","робот": "гуманоидный робот","пицца": "аппетитная пицца","бургер": "сочный бургер","кофе": "чашка эспрессо","мотоцикл урал": "старый советский мотоцикл Урал с коляской","инопланетянин": "зелёный пришелец","единорог": "белый единорог","фея": "маленькая фея","эльф": "лесной эльф","гном": "бородатый гном","скелет": "человеческий скелет","призрак": "полупрозрачный призрак","вампир": "граф Дракула"
+    }
+    all_dict = {}
+    for d in [clothes, animals, car_brands, nature, people, objects, extra]:
+        all_dict.update(d)
+    for k, v in all_dict.items():
+        if k in low:
+            low = low.replace(k, v)
+            break
+    return f"8k, ultra hd, photorealism: {low}"
+
+# ---------- ГЕНЕРАЦИЯ КАРТИНОК ----------
+def generate_image_pollinations(prompt, size):
+    enhanced = enhance_prompt(prompt)
+    url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(enhanced)}?model=turbo&nologo=true"
+    if size == "512x512":
+        url += "&width=512&height=512"
+    elif size == "1024x1024":
+        url += "&width=1024&height=1024"
+    elif size == "1920x1080":
+        url += "&width=1920&height=1080"
+    try:
+        resp = requests.get(url, timeout=60)
+        if resp.status_code == 200:
+            return resp.content
+        else:
+            print(f"Pollinations error: {resp.status_code}")
+            return None
+    except Exception as e:
+        print(f"Pollinations exception: {e}")
+        return None
+
+# ---------- АНИМАЦИЯ ЗАРЯДКИ БАТАРЕИ ----------
+def animate_loading_battery(message, text):
+    frames = [
+        ("🔋", 10),
+        ("🔋", 25),
+        ("🔋", 50),
+        ("🔋", 75),
+        ("🔋", 90),
+        ("⚡", 100)
+    ]
+    for icon, percent in frames:
+        filled = percent // 10
+        bar = "█" * filled + "░" * (10 - filled)
+        loading_text = f"{text}\n\n{icon} Зарядка: [{bar}] {percent}%"
+        if percent == 100:
+            loading_text = f"{text}\n\n✅ **Готово!**"
+        try:
+            bot.edit_message_text(loading_text,
+                                  chat_id=message.chat.id,
+                                  message_id=message.message_id,
+                                  parse_mode="Markdown")
+        except:
+            pass
+        time.sleep(3.0)   # пауза 3 секунды – безопасно
+
+def generate_and_send_image(message, prompt, user_id, status_msg, size):
+    animate_loading_battery(status_msg, f"✨ Генерирую {size}: {prompt}")
+    img_data = generate_image_pollinations(prompt, size)
+    if img_data:
+        bot.delete_message(message.chat.id, status_msg.message_id)
+        chosen_model = user_model.get(user_id, "Banana (стандарт)")
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("📥 Скачать картинку", callback_data=f"download_{user_id}"),
+            InlineKeyboardButton("🎨 Сгенерировать ещё", callback_data="create_again"),
+            InlineKeyboardButton("📋 Меню", callback_data="main_menu")
+        )
+        bot.send_photo(message.chat.id, img_data,
+                       caption=f"🎨 *{prompt}*\n📐 Размер: {size}\n🤖 Модель: {chosen_model}\n💰 списано {PRICE_IMAGE} кредитов",
+                       parse_mode="Markdown", reply_markup=markup)
+        save_to_history(user_id, prompt, img_data, size)
+        time.sleep(0.5)
+    else:
+        bot.edit_message_text("❌ *Ошибка генерации.* Попробуйте позже.",
+                              chat_id=status_msg.chat.id,
+                              message_id=status_msg.message_id,
+                              parse_mode="Markdown")
+        bot.send_message(message.chat.id, "🔁 Попробуйте снова /start", reply_markup=main_reply_keyboard())
+
+# ---------- СМЕШНОЕ ВИДЕО (ТОЛЬКО ЛОКАЛЬНЫЕ ФАЙЛЫ) ----------
+def send_funny_video(message):
+    with video_semaphore:
+        video_dir = "video_library"
+        os.makedirs(video_dir, exist_ok=True)
+        files = [f for f in os.listdir(video_dir) if f.endswith('.mp4')]
+        if not files:
+            bot.reply_to(message, "🎬 Нет видео. Добавьте .mp4 в video_library/")
+            return
+        chosen = random.choice(files)
+        with open(os.path.join(video_dir, chosen), 'rb') as vid:
+            bot.send_video(message.chat.id, vid, caption="😂 Держи смешное видео!")
+            time.sleep(0.5)
+
+# ---------- БАЛАНС, ПОЛЬЗОВАТЕЛИ ----------
+def get_user(user_id):
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("SELECT balance, total_generated, referrer_id, ref_code FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return row
+
+def create_user(user_id, referrer_id=None):
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        ref_code = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        c.execute("INSERT INTO users (user_id, balance, total_generated, referrer_id, ref_code) VALUES (?, ?, ?, ?, ?)",
+                  (user_id, FREE_START, 0, referrer_id, ref_code))
+        conn.commit()
+        conn.close()
+    if referrer_id:
+        add_balance(referrer_id, REFERRAL_BONUS)
+        add_balance(user_id, REFERRAL_BONUS)
+        try:
+            bot.send_message(referrer_id, f"🎉 По вашей ссылке пришёл друг! +{REFERRAL_BONUS} кредитов.")
+        except:
+            pass
+
+def add_balance(user_id, delta):
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, user_id))
+        if c.rowcount == 0:
+            c.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, delta))
+        conn.commit()
+        conn.close()
+
+def get_balance(user_id):
+    if user_id in ADMIN_IDS:
+        return float('inf')
+    row = get_user(user_id)
+    if row is None:
+        create_user(user_id)
+        return FREE_START
+    return row[0]
+
+def use_credits(user_id, cost):
+    if user_id in ADMIN_IDS:
+        with db_lock:
+            conn = sqlite3.connect("users.db")
+            c = conn.cursor()
+            c.execute("UPDATE users SET total_generated = total_generated + 1 WHERE user_id = ?", (user_id,))
+            if c.rowcount == 0:
+                c.execute("INSERT INTO users (user_id, balance, total_generated) VALUES (?, ?, ?)", (user_id, FREE_START, 1))
+            conn.commit()
+            conn.close()
+        return True
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row or row[0] < cost:
+            conn.close()
+            return False
+        c.execute("UPDATE users SET balance = balance - ?, total_generated = total_generated + 1 WHERE user_id = ?", (cost, user_id))
+        conn.commit()
+        conn.close()
+    return True
+
+def get_ref_code(user_id):
+    row = get_user(user_id)
+    if row and row[3]:
+        return row[3]
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        code = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        c.execute("UPDATE users SET ref_code = ? WHERE user_id = ?", (code, user_id))
+        conn.commit()
+        conn.close()
+    return code
+
+def get_total_generated(user_id):
+    row = get_user(user_id)
+    return row[1] if row else 0
+
+def get_all_stats():
+    with db_lock:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0]
+        c.execute("SELECT SUM(total_generated) FROM users")
+        total_gens = c.fetchone()[0] or 0
+        conn.close()
+    return total_users, total_gens
+
+def check_rate_limit(user_id):
+    now = time.time()
+    last = user_last_request.get(user_id, 0)
+    if now - last < RATE_LIMIT:
+        return False
+    user_last_request[user_id] = now
+    return True
+
+# ---------- КЛАВИАТУРЫ ----------
+def main_reply_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(KeyboardButton("🎨 Создать"), KeyboardButton("📋 Меню"))
+    return markup
+
+def inline_menu(user_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🎨 Генерация", callback_data="generate"),
+        InlineKeyboardButton("🎬 Смешное видео", callback_data="funny_video"),
+        InlineKeyboardButton("🎲 Случайная картинка", callback_data="random_image"),
+        InlineKeyboardButton("📜 История", callback_data="history"),
+        InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+        InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+        InlineKeyboardButton("🔗 Рефералка", callback_data="referral"),
+        InlineKeyboardButton("🎁 Бонус дня", callback_data="daily_bonus"),
+        InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
+        InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
+        InlineKeyboardButton("🌐 Язык", callback_data="language")
+    )
+    if user_id in ADMIN_IDS:
+        markup.add(InlineKeyboardButton("🔧 Админ-панель", callback_data="admin"))
+    return markup
+
+def back_button(user_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="main_menu"))
+    return markup
+
+def language_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
+        InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
+        InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+    )
+    return markup
+
+def admin_keyboard(user_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+        InlineKeyboardButton("🎁 Выдать кредиты", callback_data="admin_give"),
+        InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+    )
+    return markup
+
+def settings_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🍌 Banana (стандарт)", callback_data="model_banana"),
+        InlineKeyboardButton("🍌 Banana Pro", callback_data="model_banana_pro"),
+        InlineKeyboardButton("⚡ Banana Turbo", callback_data="model_banana_turbo"),
+        InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+    )
+    return markup
+
+# ---------- ПЕРЕВОДЫ ----------
+translations = {
+    "ru": {
+        "menu": "📋 Главное меню",
+        "balance": "💰 Ваш баланс: {} кредитов",
+        "admin_unlimited": "💰 Админ: безлимит",
+        "profile": "👤 Профиль\n🆔 ID: {}\n🖼️ Сгенерировано: {}\n🔗 Реферальная ссылка: {}",
+        "referral": "🔗 Пригласите друга:\n{}\nЗа каждого +{} кредитов",
+        "copy_link": "Ссылка скопирована: {}",
+        "help": "ℹ️ Помощь:\n• Текст → картинка ({} кред.)\n• «Смешное видео» из папки\n• Пригласи друга → +{} кред.\n• Бонус дня → +5 кред.",
+        "not_enough_credits": "❌ Не хватает кредитов. Нужно {}, у вас {}.",
+        "error_generation": "❌ Ошибка. Попробуйте позже.",
+        "rate_limit": "⏳ Подождите {} сек.",
+        "language_changed": "🌐 Язык изменён на {}",
+        "stats": "📊 Статистика\n👥 Пользователей: {}\n🖼️ Картинок: {}",
+        "admin_panel": "🔧 Админ-панель",
+        "admin_give_instruction": "🎁 Выдача кредитов\nОтправьте ID и сумму через пробел.\nПример: `123456789 10`",
+        "given_credits": "✅ Выдано {} кредитов пользователю `{}`",
+        "invalid_format": "❌ Неверный формат. Используйте: ID количество",
+        "generating_image": "✨ Генерирую картинку: {}",
+        "select_size": "🎨 Выберите размер изображения:",
+        "send_prompt": "💬 Отправьте описание картинки:",
+        "wrong_input": "Пожалуйста, используйте кнопки меню."
+    },
+    "en": {
+        "menu": "📋 Main menu",
+        "balance": "💰 Your balance: {} credits",
+        "admin_unlimited": "💰 Admin: unlimited",
+        "profile": "👤 Profile\n🆔 ID: {}\n🖼️ Generated: {}\n🔗 Referral link: {}",
+        "referral": "🔗 Invite a friend:\n{}\n+{} credits per invite",
+        "copy_link": "Link copied: {}",
+        "help": "ℹ️ Help:\n• Text → image ({} cr.)\n• «Смешное видео» from folder\n• Invite friend → +{} cr.\n• Daily bonus → +5 cr.",
+        "not_enough_credits": "❌ Not enough credits. Need {}, you have {}.",
+        "error_generation": "❌ Error. Try again.",
+        "rate_limit": "⏳ Wait {} sec.",
+        "language_changed": "🌐 Language changed to {}",
+        "stats": "📊 Statistics\n👥 Users: {}\n🖼️ Images: {}",
+        "admin_panel": "🔧 Admin panel",
+        "admin_give_instruction": "🎁 Grant credits\nSend user ID and amount separated by space.\nExample: `123456789 10`",
+        "given_credits": "✅ Granted {} credits to user `{}`",
+        "invalid_format": "❌ Invalid format. Use: ID amount",
+        "generating_image": "✨ Generating image: {}",
+        "select_size": "🎨 Choose image size:",
+        "send_prompt": "💬 Send image description:",
+        "wrong_input": "Please use the menu buttons."
+    }
+}
+user_lang = {}
+def get_lang(user_id): return user_lang.get(user_id, "ru")
+def tr(user_id, key, *args):
+    lang = get_lang(user_id)
+    text = translations[lang].get(key, translations["ru"][key])
+    if args:
+        return text.format(*args)
+    return text
+
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name
+    args = message.text.split()
+    ref_code = args[1] if len(args) > 1 else None
+    row = get_user(user_id)
+    if row is None:
+        referrer_id = None
+        if ref_code:
+            with db_lock:
+                conn = sqlite3.connect("users.db")
+                c = conn.cursor()
+                c.execute("SELECT user_id FROM users WHERE ref_code = ?", (ref_code,))
+                r = c.fetchone()
+                conn.close()
+            if r and r[0] != user_id:
+                referrer_id = r[0]
+        create_user(user_id, referrer_id)
+        bal = FREE_START + (REFERRAL_BONUS if referrer_id else 0)
+        bonus_msg = f"\n\n🎉 +{REFERRAL_BONUS} по приглашению!" if referrer_id else ""
+    else:
+        bal = get_balance(user_id)
+        bonus_msg = ""
+        if daily_bonus(user_id):
+            bal = get_balance(user_id)
+            bonus_msg = "\n\n🎁 +5 кредитов за сегодня!"
+    lang = get_lang(user_id)
+    if lang == "ru":
+        welcome = (
+            f"🍌 *Привет, {first_name}!* {random.choice(['👋', '✨', '🤖', '💎'])}\n\n"
+            f"Я *нано-банановая нейросеть* – создаю картинки по тексту 🎨\n"
+            f"🔥 *Что я умею:*\n"
+            f"➤ Генерировать *фантастические изображения* – {PRICE_IMAGE} кредитов\n"
+            f"➤ Присылать *смешные видео* 🎬 (бесплатно)\n"
+            f"➤ Ежедневный бонус +5 кредитов\n\n"
+            f"💰 *Твой баланс:* {bal} кредитов\n"
+            f"🎁 *Стартовый бонус:* {FREE_START} кредитов\n"
+            f"👥 *Приведи друга* → +{REFERRAL_BONUS} кредитов\n\n"
+            f"👇 *Нажми на кнопку, чтобы начать творить!*{bonus_msg}"
+        )
+    else:
+        welcome = (
+            f"🍌 *Hello, {first_name}!* {random.choice(['👋', '✨', '🤖', '💎'])}\n\n"
+            f"I am *nano-banana neural network* – I create images from text 🎨\n"
+            f"🔥 *What I can do:*\n"
+            f"➤ Generate *fantastic images* – {PRICE_IMAGE} credits\n"
+            f"➤ Send *funny videos* 🎬 (free)\n"
+            f"➤ Daily bonus +5 credits\n\n"
+            f"💰 *Your balance:* {bal} credits\n"
+            f"🎁 *Starting bonus:* {FREE_START} credits\n"
+            f"👥 *Invite a friend* → +{REFERRAL_BONUS} credits\n\n"
+            f"👇 *Click a button to start creating!*{bonus_msg}"
+        )
+    # Отправляем только текст, без фото
+    bot.send_message(message.chat.id, welcome, parse_mode="Markdown", reply_markup=main_reply_keyboard())
+    bot.send_message(message.chat.id, tr(user_id, "menu"), reply_markup=inline_menu(user_id))
+
+@bot.message_handler(commands=['menu'])
+def cmd_menu(message):
+    user_id = message.from_user.id
+    bot.send_message(message.chat.id, tr(user_id, "menu"), reply_markup=inline_menu(user_id))
+
+@bot.message_handler(commands=['language'])
+def cmd_language(message):
+    bot.send_message(message.chat.id, "🌐 Выберите язык / Choose language:", reply_markup=language_keyboard())
+
+@bot.message_handler(func=lambda m: m.text == "🎨 Создать")
+def create_button_handler(message):
+    user_id = message.from_user.id
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🖼 512x512", callback_data="size_512"),
+        InlineKeyboardButton("🖼 1024x1024", callback_data="size_1024"),
+        InlineKeyboardButton("🖼 1920x1080", callback_data="size_1920"),
+        InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+    )
+    bot.send_message(message.chat.id, tr(user_id, "select_size"), reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == "📋 Меню")
+def menu_button_handler(message):
+    user_id = message.from_user.id
+    bot.send_message(message.chat.id, tr(user_id, "menu"), reply_markup=inline_menu(user_id))
+
+@bot.message_handler(func=lambda m: True)
+def ignore_other_messages(message):
+    pass
+
+# ---------- CALLBACK ----------
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
+    bot.answer_callback_query(call.id, cache_time=10)
+
+    if data == "main_menu":
+        bot.answer_callback_query(call.id, "🔁 Открываю главное меню...", cache_time=5)
+        bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
+
+    elif data == "generate":
+        bot.answer_callback_query(call.id, "🎨 Открываю генератор...", cache_time=5)
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🖼 512x512", callback_data="size_512"),
+            InlineKeyboardButton("🖼 1024x1024", callback_data="size_1024"),
+            InlineKeyboardButton("🖼 1920x1080", callback_data="size_1920"),
+            InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+        )
+        bot.edit_message_text(tr(user_id, "select_size"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
+
+    elif data in ("size_512", "size_1024", "size_1920"):
+        size_map = {"size_512": "512x512", "size_1024": "1024x1024", "size_1920": "1920x1080"}
+        size = size_map[data]
+        bot.answer_callback_query(call.id, f"✨ Выбран размер {size}. Введите описание.", cache_time=5)
+        bot.edit_message_text(tr(user_id, "send_prompt"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=back_button(user_id))
+        bot.register_next_step_handler(call.message, lambda m: generate_with_size(m, size, user_id))
+
+    elif data == "funny_video":
+        bot.answer_callback_query(call.id, "🎬 Ищу смешное видео...", cache_time=10)
+        send_funny_video(call.message)
+        bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
+
+    elif data == "random_image":
+        bot.answer_callback_query(call.id, "🎲 Выбираю случайный промпт...", cache_time=10)
+        if get_balance(user_id) < PRICE_IMAGE and user_id not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, f"❌ Не хватает кредитов. Нужно {PRICE_IMAGE}", show_alert=True)
+            return
+        prompt = random.choice(RANDOM_PROMPTS)
+        use_credits(user_id, PRICE_IMAGE)
+        status_msg = bot.send_message(call.message.chat.id, f"🎲 *Случайный промпт:* {prompt}\n✨ Генерирую 512x512...", parse_mode="Markdown")
+        threading.Thread(target=generate_and_send_image, args=(call.message, prompt, user_id, status_msg, "512x512")).start()
+
+    elif data == "history":
+        bot.answer_callback_query(call.id, "📜 Загружаю историю...", cache_time=10)
+        with db_lock:
+            conn = sqlite3.connect("users.db")
+            c = conn.cursor()
+            c.execute("SELECT prompt, size, timestamp FROM history WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20", (user_id,))
+            rows = c.fetchall()
+            conn.close()
+        if not rows:
+            bot.edit_message_text("📭 У вас пока нет сгенерированных картинок.", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=back_button(user_id))
+            return
+        text = "📜 *Ваши последние запросы:*\n\n"
+        for i, (prompt, size, ts) in enumerate(rows, 1):
+            date = time.strftime("%d.%m %H:%M", time.localtime(ts))
+            text += f"{i}. `{prompt[:40]}`... [{size}] {date}\n"
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("📥 Скачать историю", callback_data="download_history"),
+            InlineKeyboardButton("🖼 Последнее фото", callback_data="last_image"),
+            InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+        )
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+
+    elif data == "download_history":
+        bot.answer_callback_query(call.id, "📄 Формирую файл истории...", cache_time=15)
+        with db_lock:
+            conn = sqlite3.connect("users.db")
+            c = conn.cursor()
+            c.execute("SELECT prompt, size, timestamp FROM history WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
+            rows = c.fetchall()
+            conn.close()
+        if not rows:
+            bot.answer_callback_query(call.id, "Нет истории", show_alert=True)
+            return
+        content = "История генераций Banana AI Brain\n\n"
+        for prompt, size, ts in rows:
+            date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            content += f"[{date}] {size}: {prompt}\n"
+        bio = io.BytesIO(content.encode('utf-8'))
+        bio.name = "history.txt"
+        bot.send_document(call.message.chat.id, bio, caption="📄 Ваша история запросов")
+
+    elif data == "last_image":
+        bot.answer_callback_query(call.id, "🖼 Ищу последнее фото...", cache_time=10)
+        with db_lock:
+            conn = sqlite3.connect("users.db")
+            c = conn.cursor()
+            c.execute("SELECT image_data FROM history WHERE user_id = ? AND image_data IS NOT NULL ORDER BY timestamp DESC LIMIT 1", (user_id,))
+            row = c.fetchone()
+            conn.close()
+        if row and row[0]:
+            bot.send_photo(call.message.chat.id, row[0], caption="🖼 Ваше последнее фото")
+        else:
+            bot.answer_callback_query(call.id, "Нет сохранённых фото", show_alert=True)
+
+    elif data == "balance":
+        bal = get_balance(user_id)
+        bot.answer_callback_query(call.id, f"💰 Ваш баланс: {bal} кредитов", cache_time=5)
+        if user_id in ADMIN_IDS:
+            bot.edit_message_text(tr(user_id, "admin_unlimited"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=back_button(user_id))
+        else:
+            bot.edit_message_text(tr(user_id, "balance", bal), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=back_button(user_id))
+
+    elif data == "profile":
+        bot.answer_callback_query(call.id, "👤 Загружаю профиль...", cache_time=10)
+        total = get_total_generated(user_id)
+        code = get_ref_code(user_id)
+        link = f"https://t.me/{bot.get_me().username}?start={code}"
+        bot.edit_message_text(tr(user_id, "profile", user_id, total, link), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=back_button(user_id))
+
+    elif data == "referral":
+        code = get_ref_code(user_id)
+        link = f"https://t.me/{bot.get_me().username}?start={code}"
+        bot.answer_callback_query(call.id, "🔗 Генерирую реферальную ссылку...", cache_time=10)
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("📋 Скопировать ссылку", callback_data="copy_link"),
+            InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+        )
+        bot.edit_message_text(tr(user_id, "referral", link, REFERRAL_BONUS), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+
+    elif data == "copy_link":
+        code = get_ref_code(user_id)
+        link = f"https://t.me/{bot.get_me().username}?start={code}"
+        bot.answer_callback_query(call.id, tr(user_id, "copy_link", link), show_alert=True)
+
+    elif data == "daily_bonus":
+        if daily_bonus(user_id):
+            new_bal = get_balance(user_id)
+            bot.answer_callback_query(call.id, f"🎁 +5 кредитов! Ваш баланс: {new_bal}", show_alert=True)
+            bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
+        else:
+            bot.answer_callback_query(call.id, "❌ Вы уже получали бонус сегодня!", show_alert=True)
+
+    elif data == "settings":
+        bot.answer_callback_query(call.id, "⚙️ Настройки", cache_time=5)
+        bot.edit_message_text("🎛️ *Выберите модель:*\n(пока выбор не влияет на результат, но в будущем добавим реальные модели)",
+                              chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              parse_mode="Markdown",
+                              reply_markup=settings_keyboard())
+
+    elif data.startswith("model_"):
+        model_map = {
+            "model_banana": "Banana (стандарт)",
+            "model_banana_pro": "Banana Pro",
+            "model_banana_turbo": "Banana Turbo"
+        }
+        selected = model_map.get(data, "Banana (стандарт)")
+        user_model[user_id] = selected
+        bot.answer_callback_query(call.id, f"✅ Выбрана модель: {selected}", show_alert=True)
+        bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
+
+    elif data == "help":
+        bot.answer_callback_query(call.id, "ℹ️ Открываю помощь...", cache_time=5)
+        bot.edit_message_text(tr(user_id, "help", PRICE_IMAGE, REFERRAL_BONUS), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=back_button(user_id))
+
+    elif data == "language":
+        bot.answer_callback_query(call.id, "🌐 Выбираем язык...", cache_time=5)
+        bot.edit_message_text("🌐 Выберите язык / Choose language:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=language_keyboard())
+
+    elif data.startswith("lang_"):
+        lang_code = data[5:]
+        if lang_code in ["ru", "en"]:
+            user_lang[user_id] = lang_code
+            bot.answer_callback_query(call.id, tr(user_id, "language_changed", lang_code), show_alert=True)
+            bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
+
+    elif data == "admin":
+        bot.answer_callback_query(call.id, "🔧 Открываю админ-панель...", cache_time=5)
+        if user_id not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, "Нет доступа", show_alert=True)
+            return
+        bot.edit_message_text(tr(user_id, "admin_panel"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=admin_keyboard(user_id))
+
+    elif data == "stats":
+        bot.answer_callback_query(call.id, "📊 Загружаю статистику...", cache_time=10)
+        if user_id not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, "Нет доступа", show_alert=True)
+            return
+        users, gens = get_all_stats()
+        bot.edit_message_text(tr(user_id, "stats", users, gens), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=back_button(user_id))
+
+    elif data == "admin_give":
+        bot.answer_callback_query(call.id, "🎁 Выдача кредитов", cache_time=10)
+        if user_id not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, "Нет доступа", show_alert=True)
+            return
+        bot.edit_message_text(tr(user_id, "admin_give_instruction"), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=back_button(user_id))
+        bot.register_next_step_handler(call.message, admin_give_credits_step)
+
+    elif data == "create_again":
+        bot.answer_callback_query(call.id, "🎨 Снова создаём картинку...", cache_time=5)
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🖼 512x512", callback_data="size_512"),
+            InlineKeyboardButton("🖼 1024x1024", callback_data="size_1024"),
+            InlineKeyboardButton("🖼 1920x1080", callback_data="size_1920"),
+            InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
+        )
+        bot.send_message(call.message.chat.id, tr(user_id, "select_size"), reply_markup=markup)
+
+    elif data.startswith("download_"):
+        bot.answer_callback_query(call.id, "📥 Скачиваю картинку...", cache_time=15)
+        with db_lock:
+            conn = sqlite3.connect("users.db")
+            c = conn.cursor()
+            c.execute("SELECT image_data FROM history WHERE user_id = ? AND image_data IS NOT NULL ORDER BY timestamp DESC LIMIT 1", (user_id,))
+            row = c.fetchone()
+            conn.close()
+        if row and row[0]:
+            bot.send_document(call.message.chat.id, io.BytesIO(row[0]), caption="📷 Ваша картинка в оригинальном качестве")
+        else:
+            bot.answer_callback_query(call.id, "Нет картинки для скачивания", show_alert=True)
+
+def generate_with_size(message, size, user_id):
+    prompt = message.text.strip()
+    if not prompt:
+        bot.reply_to(message, "Напишите описание.")
+        return
+    if not check_rate_limit(user_id):
+        bot.reply_to(message, tr(user_id, "rate_limit", RATE_LIMIT))
+        return
+    if not use_credits(user_id, PRICE_IMAGE):
+        bal = get_balance(user_id)
+        bot.reply_to(message, tr(user_id, "not_enough_credits", PRICE_IMAGE, bal))
+        return
+    status_msg = bot.reply_to(message, f"✨ Генерирую {size}: {prompt}")
+    threading.Thread(target=generate_and_send_image, args=(message, prompt, user_id, status_msg, size)).start()
+
+def admin_give_credits_step(message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    try:
+        parts = message.text.strip().split()
+        target_id = int(parts[0])
+        amount = int(parts[1])
+        if amount <= 0 or amount > 10000:
+            bot.reply_to(message, tr(user_id, "invalid_format"))
+            return
+        add_balance(target_id, amount)
+        bot.reply_to(message, tr(user_id, "given_credits", amount, target_id))
+        bot.send_message(target_id, f"🎁 Администратор выдал вам {amount} кредитов!")
+    except:
+        bot.reply_to(message, tr(user_id, "invalid_format"))
+    bot.send_message(message.chat.id, tr(user_id, "menu"), reply_markup=inline_menu(user_id))
+
+# ---------- ЗАПУСК ----------
+if __name__ == "__main__":
+    try:
+        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
+    except:
+        pass
+    init_db()
+    print("🚀 Бот Banana AI Brain запущен (обновлённая версия с бонусами, анимацией батареи, настройками)")
+    print("✅ Ежедневный бонус +5 кредитов, анимация загрузки 🔋, выбор модели (заглушка)")
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except ApiTelegramException as e:
+            if e.result_json.get('error_code') == 429:
+                retry_after = e.result_json.get('parameters', {}).get('retry_after', 5)
+                print(f"⚠️ Ошибка 429: пауза {retry_after} сек.")
+                time.sleep(retry_after)
+            else:
+                print(f"❌ Ошибка API: {e}")
+                time.sleep(5)
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            time.sleep(5)
