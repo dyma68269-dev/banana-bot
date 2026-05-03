@@ -8,3 +8,4 @@ pillow
 requests
 flask
 flask-cors
+flask-cors
