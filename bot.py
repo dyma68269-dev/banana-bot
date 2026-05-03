@@ -8,27 +8,22 @@ import requests
 import io
 import threading
 import datetime
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from telebot.apihelper import ApiTelegramException
 from PIL import Image
+from flask import Flask
+import sys
 
-# ========== НАСТРОЙКИ ==========
+# ========== НАСТРОЙКИ (ВСТАВЬТЕ СВОИ ЗНАЧЕНИЯ) ==========
 BOT_TOKEN = "8565283538:AAFRofE7y_L-bNojwLYyT_XBqd-h7KZb7JQ"   # ВАШ ТОКЕН
-CHANNEL_ID = "-1003976758360"                                 # ID вашего канала
+CHANNEL_ID = "-1003976758360"                                 # ID канала
 CHANNEL_LINK = "https://t.me/gfhh679"                         # Ссылка на канал
-PAYMENTS_TOKEN = "ВАШ_ТОКЕН_ОТ_@BotFather"                    # Токен для Telegram Stars (получить у BotFather)
 RATE_LIMIT = 5
 FREE_START = 30
 PRICE_IMAGE = 15
 REFERRAL_BONUS = 10
 ADMIN_IDS = [8242980039]          # ВАШ TELEGRAM ID
-
-# Цены на кредиты (кредиты -> цена в звёздах)
-PRICES = [
-    {"credits": 60, "stars": 30, "label": "⭐ 30 звёзд = 60 кредитов"},
-    {"credits": 100, "stars": 60, "label": "⭐ 60 звёзд = 100 кредитов"},
-    {"credits": 500, "stars": 300, "label": "⭐ 300 звёзд = 500 кредитов"}
-]
+# ============================================================
 
 RANDOM_PROMPTS = [
     "киберпанк кот в неоновых очках",
@@ -47,7 +42,19 @@ user_model = {}
 db_lock = threading.Lock()
 video_semaphore = threading.Semaphore(1)
 
-# ---------- БАЗА ДАННЫХ (добавляем last_activity для напоминаний) ----------
+# ---------- Flask-сервер для Render (чтобы приложение "слушало" порт) ----------
+# Это не влияет на работу бота, но требуется для успешного деплоя.
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "Banana AI Brain bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port, debug=False)
+
+# ---------- БАЗА ДАННЫХ ----------
 def init_db():
     with db_lock:
         conn = sqlite3.connect("users.db")
@@ -58,14 +65,11 @@ def init_db():
                       total_generated INTEGER DEFAULT 0,
                       referrer_id INTEGER DEFAULT NULL,
                       ref_code TEXT UNIQUE,
-                      last_daily TEXT,
-                      last_activity REAL)''')
+                      last_daily TEXT)''')
         try:
             c.execute("ALTER TABLE users ADD COLUMN last_daily TEXT")
-        except: pass
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN last_activity REAL")
-        except: pass
+        except sqlite3.OperationalError:
+            pass
         c.execute('''CREATE TABLE IF NOT EXISTS history
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       user_id INTEGER,
@@ -73,17 +77,6 @@ def init_db():
                       image_data BLOB,
                       size TEXT,
                       timestamp REAL)''')
-        conn.commit()
-        conn.close()
-
-# ---------- ОБНОВЛЕНИЕ АКТИВНОСТИ (для напоминаний) ----------
-def update_activity(user_id):
-    with db_lock:
-        conn = sqlite3.connect("users.db")
-        c = conn.cursor()
-        c.execute("UPDATE users SET last_activity = ? WHERE user_id = ?", (time.time(), user_id))
-        if c.rowcount == 0:
-            c.execute("INSERT INTO users (user_id, last_activity) VALUES (?, ?)", (user_id, time.time()))
         conn.commit()
         conn.close()
 
@@ -125,13 +118,14 @@ def ensure_subscribed(message):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK))
         bot.send_message(message.chat.id,
-                         "🍌 *Доступ к боту открыт только для подписчиков канала!*\n\n"
+                         "🍌 *Для использования бота необходимо подписаться на канал!*\n\n"
                          "Нажмите кнопку ниже, подпишитесь, а затем вернитесь и нажмите /start.",
-                         parse_mode="Markdown", reply_markup=markup)
+                         parse_mode="Markdown",
+                         reply_markup=markup)
         return False
     return True
 
-# ---------- ПОЛНЫЙ СЛОВАРЬ (ваш, без изменений) ----------
+# ---------- УЛУЧШЕНИЕ ПРОМПТА (полный словарь) ----------
 def enhance_prompt(user_prompt: str) -> str:
     low = user_prompt.lower().strip()
     clothes = {
@@ -185,6 +179,7 @@ def generate_image_pollinations(prompt, size):
         print(f"Pollinations exception: {e}")
         return None
 
+# ---------- АНИМАЦИЯ (сокращённая, чтобы не было 429) ----------
 def animate_loading_battery(message, text):
     frames = [("🔋",10),("🔋",25),("🔋",50),("🔋",75),("🔋",90),("⚡",100)]
     for icon, percent in frames:
@@ -197,7 +192,7 @@ def animate_loading_battery(message, text):
             bot.edit_message_text(loading_text, chat_id=message.chat.id, message_id=message.message_id, parse_mode="Markdown")
         except:
             pass
-        time.sleep(3.0)
+        time.sleep(2.5)
 
 def generate_and_send_image(message, prompt, user_id, status_msg, size):
     animate_loading_battery(status_msg, f"✨ Генерирую {size}: {prompt}")
@@ -213,11 +208,15 @@ def generate_and_send_image(message, prompt, user_id, status_msg, size):
         )
         bot.send_photo(message.chat.id, img_data,
                        caption=f"🎨 *{prompt}*\n📐 Размер: {size}\n🤖 Модель: {chosen_model}\n💰 списано {PRICE_IMAGE} кредитов",
-                       parse_mode="Markdown", reply_markup=markup)
+                       parse_mode="Markdown",
+                       reply_markup=markup)
         save_to_history(user_id, prompt, img_data, size)
         time.sleep(0.5)
     else:
-        bot.edit_message_text("❌ *Ошибка генерации.* Попробуйте позже.", chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+        bot.edit_message_text("❌ *Ошибка генерации.* Попробуйте позже.",
+                              chat_id=status_msg.chat.id,
+                              message_id=status_msg.message_id,
+                              parse_mode="Markdown")
         bot.send_message(message.chat.id, "🔁 Попробуйте снова /start", reply_markup=main_reply_keyboard())
 
 # ---------- СМЕШНОЕ ВИДЕО ----------
@@ -234,39 +233,7 @@ def send_funny_video(message):
             bot.send_video(message.chat.id, vid, caption="😂 Держи смешное видео!")
             time.sleep(0.5)
 
-# ---------- ОПЛАТА ЗВЁЗДАМИ ----------
-def send_stars_invoice(user_id, credits, stars):
-    try:
-        bot.send_invoice(
-            user_id,
-            title=f"⭐ {credits} кредитов",
-            description=f"Покупка {credits} кредитов для Banana AI Brain",
-            invoice_payload=f"credits_{credits}",
-            provider_token=PAYMENTS_TOKEN,
-            currency="XTR",
-            prices=[LabeledPrice(label=f"{credits} кредитов", amount=stars)],
-            start_parameter="buy_credits"
-        )
-        return True
-    except Exception as e:
-        print(f"Ошибка инвойса: {e}")
-        return False
-
-@bot.pre_checkout_query_handler(func=lambda query: True)
-def checkout_handler(query):
-    bot.answer_pre_checkout_query(query.id, ok=True)
-
-@bot.message_handler(content_types=['successful_payment'])
-def payment_handler(message):
-    user_id = message.from_user.id
-    payload = message.successful_payment.invoice_payload
-    if payload.startswith("credits_"):
-        credits = int(payload.split("_")[1])
-        add_balance(user_id, credits)
-        bot.send_message(user_id, f"✅ Пополнение успешно! Вам начислено {credits} кредитов. Новый баланс: {get_balance(user_id)} кредитов.")
-        update_activity(user_id)
-
-# ---------- ПОЛЬЗОВАТЕЛИ, БАЛАНС (добавлена колонка last_activity) ----------
+# ---------- БАЛАНС, ПОЛЬЗОВАТЕЛИ ----------
 def get_user(user_id):
     with db_lock:
         conn = sqlite3.connect("users.db")
@@ -281,8 +248,8 @@ def create_user(user_id, referrer_id=None):
         conn = sqlite3.connect("users.db")
         c = conn.cursor()
         ref_code = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-        c.execute("INSERT INTO users (user_id, balance, total_generated, referrer_id, ref_code, last_activity) VALUES (?, ?, ?, ?, ?, ?)",
-                  (user_id, FREE_START, 0, referrer_id, ref_code, time.time()))
+        c.execute("INSERT INTO users (user_id, balance, total_generated, referrer_id, ref_code) VALUES (?, ?, ?, ?, ?)",
+                  (user_id, FREE_START, 0, referrer_id, ref_code))
         conn.commit()
         conn.close()
     if referrer_id:
@@ -302,7 +269,6 @@ def add_balance(user_id, delta):
             c.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, delta))
         conn.commit()
         conn.close()
-    update_activity(user_id)
 
 def get_balance(user_id):
     if user_id in ADMIN_IDS:
@@ -323,7 +289,6 @@ def use_credits(user_id, cost):
                 c.execute("INSERT INTO users (user_id, balance, total_generated) VALUES (?, ?, ?)", (user_id, FREE_START, 1))
             conn.commit()
             conn.close()
-        update_activity(user_id)
         return True
     with db_lock:
         conn = sqlite3.connect("users.db")
@@ -336,7 +301,6 @@ def use_credits(user_id, cost):
         c.execute("UPDATE users SET balance = balance - ?, total_generated = total_generated + 1 WHERE user_id = ?", (cost, user_id))
         conn.commit()
         conn.close()
-    update_activity(user_id)
     return True
 
 def get_ref_code(user_id):
@@ -392,7 +356,6 @@ def inline_menu(user_id):
         InlineKeyboardButton("👤 Профиль", callback_data="profile"),
         InlineKeyboardButton("🔗 Рефералка", callback_data="referral"),
         InlineKeyboardButton("🎁 Бонус дня", callback_data="daily_bonus"),
-        InlineKeyboardButton("⭐ Купить кредиты", callback_data="buy_credits"),
         InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
         InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
         InlineKeyboardButton("🌐 Язык", callback_data="language")
@@ -434,14 +397,7 @@ def settings_keyboard():
     )
     return markup
 
-def buy_credits_keyboard():
-    markup = InlineKeyboardMarkup(row_width=1)
-    for p in PRICES:
-        markup.add(InlineKeyboardButton(p["label"], callback_data=f"buy_{p['credits']}_{p['stars']}"))
-    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="main_menu"))
-    return markup
-
-# ---------- ПЕРЕВОДЫ (полные) ----------
+# ---------- ПЕРЕВОДЫ ----------
 translations = {
     "ru": {
         "menu": "📋 Главное меню",
@@ -497,7 +453,7 @@ def tr(user_id, key, *args):
         return text.format(*args)
     return text
 
-# ---------- ОБРАБОТЧИКИ КОМАНД (с проверкой подписки) ----------
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     user_id = message.from_user.id
@@ -600,7 +556,7 @@ def menu_button_handler(message):
 def ignore_other_messages(message):
     pass
 
-# ---------- CALLBACK ----------
+# ---------- ОБРАБОТЧИКИ CALLBACK (сокращённо, но полные) ----------
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
@@ -612,16 +568,20 @@ def callback_handler(call):
         markup.add(InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK))
         bot.edit_message_text("🍌 *Доступ к боту открыт только для подписчиков канала!*\n\n"
                               "Нажмите кнопку ниже, подпишитесь и нажмите /start снова.",
-                              chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode="Markdown", reply_markup=markup)
+                              chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              parse_mode="Markdown",
+                              reply_markup=markup)
         return
 
     bot.answer_callback_query(call.id, cache_time=10)
 
     if data == "main_menu":
+        bot.answer_callback_query(call.id, "🔁 Открываю главное меню...", cache_time=5)
         bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
 
     elif data == "generate":
+        bot.answer_callback_query(call.id, "🎨 Открываю генератор...", cache_time=5)
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
             InlineKeyboardButton("🖼 512x512", callback_data="size_512"),
@@ -634,14 +594,17 @@ def callback_handler(call):
     elif data in ("size_512","size_1024","size_1920"):
         size_map = {"size_512":"512x512","size_1024":"1024x1024","size_1920":"1920x1080"}
         size = size_map[data]
+        bot.answer_callback_query(call.id, f"✨ Выбран размер {size}. Введите описание.", cache_time=5)
         bot.edit_message_text(tr(user_id, "send_prompt"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=back_button(user_id))
         bot.register_next_step_handler(call.message, lambda m: generate_with_size(m, size, user_id))
 
     elif data == "funny_video":
+        bot.answer_callback_query(call.id, "🎬 Ищу смешное видео...", cache_time=10)
         send_funny_video(call.message)
         bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
 
     elif data == "random_image":
+        bot.answer_callback_query(call.id, "🎲 Выбираю случайный промпт...", cache_time=10)
         if get_balance(user_id) < PRICE_IMAGE and user_id not in ADMIN_IDS:
             bot.answer_callback_query(call.id, f"❌ Не хватает кредитов. Нужно {PRICE_IMAGE}", show_alert=True)
             return
@@ -651,6 +614,7 @@ def callback_handler(call):
         threading.Thread(target=generate_and_send_image, args=(call.message, prompt, user_id, status_msg, "512x512")).start()
 
     elif data == "history":
+        bot.answer_callback_query(call.id, "📜 Загружаю историю...", cache_time=10)
         with db_lock:
             conn = sqlite3.connect("users.db")
             c = conn.cursor()
@@ -687,7 +651,6 @@ def callback_handler(call):
             date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
             content += f"[{date}] {size}: {prompt}\n"
         bio = io.BytesIO(content.encode('utf-8'))
-        bio.name = "history.txt"
         bot.send_document(call.message.chat.id, bio, caption="📄 Ваша история запросов")
 
     elif data == "last_image":
@@ -737,15 +700,6 @@ def callback_handler(call):
             bot.edit_message_text(tr(user_id, "menu"), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=inline_menu(user_id))
         else:
             bot.answer_callback_query(call.id, "❌ Вы уже получали бонус сегодня!", show_alert=True)
-
-    elif data == "buy_credits":
-        bot.edit_message_text("⭐ *Выберите количество кредитов:*", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown", reply_markup=buy_credits_keyboard())
-
-    elif data.startswith("buy_"):
-        parts = data.split("_")
-        credits = int(parts[1])
-        stars = int(parts[2])
-        send_stars_invoice(user_id, credits, stars)
 
     elif data == "settings":
         bot.edit_message_text("🎛️ *Выберите модель:*\n(пока выбор не влияет на результат, но в будущем добавим реальные модели)",
@@ -850,40 +804,13 @@ def admin_give_credits_step(message):
         bot.reply_to(message, tr(user_id, "invalid_format"))
     bot.send_message(message.chat.id, tr(user_id, "menu"), reply_markup=inline_menu(user_id))
 
-# ---------- ФОНОВЫЙ ПОТОК НАПОМИНАНИЙ (каждые 5 часов) ----------
-def reminder_worker():
-    while True:
-        time.sleep(5 * 3600)  # 5 часов
-        now = time.time()
-        week_ago = now - 7 * 24 * 3600
-        with db_lock:
-            conn = sqlite3.connect("users.db")
-            c = conn.cursor()
-            c.execute("SELECT user_id FROM users WHERE last_activity > ? OR last_activity IS NULL", (week_ago,))
-            users = c.fetchall()
-            conn.close()
-        for (uid,) in users:
-            try:
-                markup = InlineKeyboardMarkup()
-                markup.add(InlineKeyboardButton("⭐ Пополнить баланс", callback_data="buy_credits"))
-                bot.send_message(uid,
-                                 "🍌 *Напоминание:* Вы можете купить дополнительные кредиты за Telegram Stars и генерировать ещё больше крутых картинок!",
-                                 parse_mode="Markdown", reply_markup=markup)
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"Ошибка напоминания {uid}: {e}")
-
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
-    try:
-        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
-    except:
-        pass
     init_db()
-    reminder_thread = threading.Thread(target=reminder_worker, daemon=True)
-    reminder_thread.start()
-    print("🚀 Бот Banana AI Brain запущен с оплатой звёздами и напоминаниями каждые 5 часов!")
-    print("✅ Для работы платежей укажите PAYMENTS_TOKEN от @BotFather (Telegram Stars)")
+    # Запускаем Flask-сервер в отдельном потоке (для Render)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("🚀 Бот Banana AI Brain запущен (Flask-сервер для Render в фоне)")
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=60)
