@@ -1,0 +1,5 @@
+pyTelegramBotAPI
+pillow
+requests
+flask
+flask-cors
